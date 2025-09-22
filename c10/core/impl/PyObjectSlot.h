@@ -1,6 +1,5 @@
 #pragma once
 
-#include <c10/core/impl/HermeticPyObjectTLS.h>
 #include <c10/core/impl/PyInterpreter.h>
 #include <c10/core/impl/PyInterpreterHooks.h>
 #include <c10/util/python_stub.h>
@@ -41,32 +40,15 @@ struct C10_API PyObjectSlot {
   // a non-nullopt (but possibly null) PyObject.  If (possibly) untagged,
   // returns a nullopt.  If it is definitely invalid, raises an error.
   //
-  // If `ignore_hermetic_tls` is false and this function is called from a
-  // hermetic context (ie, `HermeticPyObjectTLS::get_state()` is true), then
-  // nullopt is returned. If `ignore_hermetic_tls` is true, then the hermetic
-  // context is ignored, allowing you to check the interpreter tag of a
-  // nonhermetic PyObject from within a hermetic context. This is necessary
-  // because there are some cases where the deallocator function of a
-  // nonhermetic PyObject is called from within a hermetic context, so it must
-  // be properly treated as a nonhermetic PyObject.
-  //
   // NB: this lives in header so that we can avoid actually creating the
   // std::optional
 
-  // @todo alban: I'm not too sure what's going on here, we can probably delete
-  // it but it's worthwhile making sure
-  std::optional<PyObject*> check_pyobj(bool ignore_hermetic_tls = false) const {
-    impl::PyInterpreter* interpreter =
-        pyobj_interpreter_.load(std::memory_order_acquire);
-    if (interpreter == nullptr) {
+  std::optional<PyObject*> check_pyobj() const {
+    impl::PyInterpreter* interpreter = getGlobalPyInterpreter();
+    if (interpreter == nullptr || pyobj_ == nullptr) {
       return std::nullopt;
     }
-
-    if (!ignore_hermetic_tls && c10::impl::HermeticPyObjectTLS::get_state()) {
-      return std::nullopt;
-    } else {
-      return _unchecked_untagged_pyobj();
-    }
+    return _unchecked_untagged_pyobj();
   }
 
   PyInterpreter& load_pyobj_interpreter() const;
