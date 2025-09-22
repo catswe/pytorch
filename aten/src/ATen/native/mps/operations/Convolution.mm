@@ -134,7 +134,7 @@ static Tensor _mps_convolution_impl(const Tensor& input_t_,
     bias_defined = bias_opt->defined();
 
   auto memory_format = input_t.suggest_memory_format();
-  bool is_channels_last = (memory_format == at::MemoryFormat::ChannelsLast) && !is3DConv;
+  bool is_channels_last = mps_conv_use_channels_last(input_t, weight_t) && !is3DConv && is_macOS_15_0_or_newer;
   auto output_t =
       at::empty(input_shape.has_value() ? input_shape.value()
                                         : conv_output_size(input->sizes(), weight->sizes(), padding, stride, dilation),
@@ -142,7 +142,7 @@ static Tensor _mps_convolution_impl(const Tensor& input_t_,
                 std::nullopt,
                 kMPS,
                 std::nullopt,
-                is_macOS_15_0_or_newer ? memory_format : MemoryFormat::Contiguous);
+                is_channels_last ? MemoryFormat::ChannelsLast : MemoryFormat::Contiguous);
   if (output_t.numel() == 0) {
     return output_t;
   }
@@ -193,21 +193,13 @@ static Tensor _mps_convolution_impl(const Tensor& input_t_,
 
     MPSShape* inputShape = mps::getMPSShape(input_t, memory_format);
     MPSShape* outputShape = mps::getMPSShape(output_t, memory_format);
-    MPSNDArray* inputNDArray = nil;
-    MPSNDArray* outputNDArray = nil;
-
-    if (input_t.is_contiguous(memory_format) && output_t.is_contiguous(memory_format) && is_macOS_15_0_or_newer) {
-      inputNDArray = getMPSNDArray(input_t, inputShape);
-      outputNDArray = getMPSNDArray(*output, outputShape);
-    }
 
     auto cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
       MPSShape* weightShape = mps::getMPSShape(weight_t);
       bool isDepthwiseConv = ((groups > 1 && (weightShape[1].intValue == 1)) && inputShape.count >= 4 &&
                               weightShape.count >= 4 && !is_channels_last);
 
-      MPSGraphTensor* inputTensor =
-          mpsGraphRankedPlaceHolder(mpsGraph, getMPSScalarType(input_t.scalar_type()), inputShape);
+      MPSGraphTensor* inputTensor = mpsGraphRankedPlaceHolder(mpsGraph, input_t);
       MPSGraphTensor* weightTensor = mpsGraphRankedPlaceHolder(mpsGraph, weight_t);
       MPSGraphTensor* outputTensor;
       if (is3DConv) {
@@ -258,7 +250,7 @@ static Tensor _mps_convolution_impl(const Tensor& input_t_,
                        dilation[0],
                        padding[1],
                        padding[0],
-                       memory_format,
+                       MemoryFormat::Contiguous,
                        groups);
 
         outputTensor = [mpsGraph convolution2DWithSourceTensor:inputTensor
@@ -272,10 +264,6 @@ static Tensor _mps_convolution_impl(const Tensor& input_t_,
         biasTensor = mpsGraphUnrankedPlaceHolder(mpsGraph, getMPSDataType(bias_opt.value()));
       }
 
-      if (is_channels_last && !is_macOS_15_0_or_newer) {
-        outputTensor = mps::convertNHWCtoNCHW(mpsGraph, outputTensor);
-      }
-
       if (bias_defined) {
         outputTensor = [mpsGraph additionWithPrimaryTensor:outputTensor secondaryTensor:biasTensor name:nil];
       }
@@ -285,8 +273,7 @@ static Tensor _mps_convolution_impl(const Tensor& input_t_,
       newCachedGraph->outputTensor_ = outputTensor;
     });
 
-    auto inputPlaceholder = inputNDArray ? Placeholder(cachedGraph->inputTensor_, inputNDArray)
-                                         : Placeholder(cachedGraph->inputTensor_, input_t, inputShape);
+    auto inputPlaceholder = Placeholder(cachedGraph->inputTensor_, input_t);
     auto weightsPlaceholder = Placeholder(cachedGraph->weightTensor_, weight_t);
     auto biasPlaceholder = Placeholder();
     // Reshape the bias to be broadcastable with output of conv2d or conv3d
@@ -294,15 +281,10 @@ static Tensor _mps_convolution_impl(const Tensor& input_t_,
       if (is3DConv) {
         biasPlaceholder = Placeholder(cachedGraph->biasTensor_, (bias_opt.value()).view({1, bias_shape[0], 1, 1, 1}));
       } else {
-        if (is_channels_last && is_macOS_15_0_or_newer) {
-          biasPlaceholder = Placeholder(cachedGraph->biasTensor_, (bias_opt.value()).view({1, 1, 1, bias_shape[0]}));
-        } else {
-          biasPlaceholder = Placeholder(cachedGraph->biasTensor_, (bias_opt.value()).view({1, bias_shape[0], 1, 1}));
-        }
+        biasPlaceholder = Placeholder(cachedGraph->biasTensor_, (bias_opt.value()).view({1, bias_shape[0], 1, 1}));
       }
     }
-    auto outputPlaceholder = outputNDArray ? Placeholder(cachedGraph->outputTensor_, outputNDArray)
-                                           : Placeholder(cachedGraph->outputTensor_, *output);
+    auto outputPlaceholder = Placeholder(cachedGraph->outputTensor_, *output);
 
     NSMutableDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds =
         [[[NSMutableDictionary alloc] initWithCapacity:3] autorelease];
@@ -351,9 +333,10 @@ static Tensor mps_convolution_backward_input(IntArrayRef input_size,
   TensorArg grad_output{grad_output_t, "grad_output", 1}, weight{weight_t, "weight", 2};
   checkAllSameType(c, {grad_output, weight});
   checkAllSameGPU(c, {grad_output, weight});
-  auto memory_format = grad_output_t.suggest_memory_format();
-  bool is_channels_last = (memory_format == at::MemoryFormat::ChannelsLast) && !is3DConv;
-  auto grad_input_t = at::empty(input_size, grad_output_t.options(), std::nullopt);
+  constexpr auto kChannelsLast = at::MemoryFormat::ChannelsLast;
+  bool is_channels_last = mps_conv_use_channels_last(grad_output_t, weight_t) && !is3DConv;
+  auto grad_input_t =
+      at::empty(input_size, grad_output_t.options(), is_channels_last ? std::optional(kChannelsLast) : std::nullopt);
 
   // Avoid "grad_input" when this is being used as transposed convolution
   TensorArg grad_input{grad_input_t, "result", 0};
@@ -370,7 +353,6 @@ static Tensor mps_convolution_backward_input(IntArrayRef input_size,
   // Add backward with input
   @autoreleasepool {
     MPSStream* stream = getCurrentMPSStream();
-
     MPSShape* mps_input_shape = getMPSShape(input_size);
     std::string key = fmt::format("mps_{}_convolution_backward_input:{}:{}:{}:{}:{}:{}",
                                   is3DConv ? "3d_" : "",
@@ -477,6 +459,8 @@ static Tensor mps_convolution_backward_weights(IntArrayRef weight_size,
   bool is3DConv = input_t.dim() == 5;
   TORCH_CHECK(isFloatingType(grad_output_t.scalar_type()), "Convolution is supported only for Floating types");
   CheckedFrom c = "mps_convolution_backward_weights";
+  constexpr auto kChannelsLast = at::MemoryFormat::ChannelsLast;
+  bool is_channels_last = mps_conv_use_channels_last(input_t, grad_output_t) && !is3DConv;
 
   // For uniformity with everything else, although it seems grad_weight
   // would be unambiguous too.
@@ -487,7 +471,7 @@ static Tensor mps_convolution_backward_weights(IntArrayRef weight_size,
   checkAllSameGPU(c, {grad_output, input});
 
   auto grad_weight_t =
-      at::empty(weight_size, grad_output_t.scalar_type(), std::nullopt, kMPS, std::nullopt, std::nullopt);
+      at::empty(weight_size, grad_output_t.options(), is_channels_last ? std::optional(kChannelsLast) : std::nullopt);
   TensorArg grad_weight{grad_weight_t, "result", 0};
 
   convolution_shape_check(c, input, grad_weight, grad_output, padding, stride, dilation, groups);
@@ -504,12 +488,13 @@ static Tensor mps_convolution_backward_weights(IntArrayRef weight_size,
     MPSStream* stream = getCurrentMPSStream();
 
     MPSShape* mps_weight_shape = getMPSShape(weight_size);
-    std::string key = fmt::format("mps_{}convolution_backward_weights:{}:{}:{}:{}:{}",
+    std::string key = fmt::format("mps_{}convolution_backward_weights:{}:{}:{}:{}:{}:{}",
                                   is3DConv ? "3d_" : "",
                                   getArrayRefString(stride),
                                   getArrayRefString(dilation),
                                   getArrayRefString(padding),
                                   groups,
+                                  is_channels_last,
                                   getTensorsStringKey({grad_output_t, input_t, grad_weight_t}));
     auto cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
       MPSShape* inputShape = getMPSShape(input_t);
