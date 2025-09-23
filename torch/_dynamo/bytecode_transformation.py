@@ -799,10 +799,7 @@ def assemble(instructions: list[Instruction], firstlineno: int) -> tuple[bytes, 
             for _ in range(instruction_size(inst) // 2 - 1):
                 code.extend((0, 0))
     else:
-        if sys.version_info < (3, 10):
-            lnotab, update_lineno = lnotab_writer(firstlineno)
-        else:
-            lnotab, update_lineno, end = linetable_310_writer(firstlineno)
+        lnotab, update_lineno, end = linetable_310_writer(firstlineno)
 
         for inst in instructions:
             if inst.starts_line is not None:
@@ -810,8 +807,7 @@ def assemble(instructions: list[Instruction], firstlineno: int) -> tuple[bytes, 
             arg = inst.arg or 0
             code.extend((inst.opcode, arg & 0xFF))
 
-        if sys.version_info >= (3, 10):
-            end(len(code))
+        end(len(code))
 
     return bytes(code), bytes(lnotab)
 
@@ -903,9 +899,7 @@ def devirtualize_jumps(instructions: list[Instruction]) -> None:
             assert inst.target is not None
             target = _get_instruction_front(instructions, indexof[inst.target])
             if inst.opcode in dis.hasjabs:
-                if sys.version_info < (3, 10):
-                    inst.arg = target.offset
-                elif sys.version_info < (3, 11):
+                if sys.version_info < (3, 11):
                     # `arg` is expected to be bytecode offset, whereas `offset` is byte offset.
                     # Divide since bytecode is 2 bytes large.
                     inst.arg = int(target.offset / 2)
@@ -917,9 +911,7 @@ def devirtualize_jumps(instructions: list[Instruction]) -> None:
                 inst.arg = abs(
                     int(target.offset - inst.offset - instruction_size(inst))
                 )
-                if sys.version_info >= (3, 10):
-                    # see bytecode size comment in the absolute jump case above
-                    inst.arg //= 2
+                inst.arg //= 2
             inst.argval = target.offset
             inst.argrepr = f"to {target.offset}"
 
@@ -1558,10 +1550,7 @@ def get_code_keys() -> list[str]:
     if sys.version_info >= (3, 11):
         keys.append("co_qualname")
     keys.append("co_firstlineno")
-    if sys.version_info >= (3, 10):
-        keys.append("co_linetable")
-    else:
-        keys.append("co_lnotab")
+    keys.append("co_linetable")
     if sys.version_info >= (3, 11):
         # not documented, but introduced in https://github.com/python/cpython/issues/84403
         keys.append("co_exceptiontable")
@@ -1618,10 +1607,7 @@ def clean_and_assemble_instructions(
 
     remove_extra_line_nums(instructions)
     bytecode, lnotab = assemble(instructions, code_options["co_firstlineno"])
-    if sys.version_info < (3, 10):
-        code_options["co_lnotab"] = lnotab
-    else:
-        code_options["co_linetable"] = lnotab
+    code_options["co_linetable"] = lnotab
 
     code_options["co_code"] = bytecode
     code_options["co_stacksize"] = stacksize_analysis(instructions)
